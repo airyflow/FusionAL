@@ -79,6 +79,9 @@ runs/
 wandb/
 tensorboard/
 logs/
+models/
+data/
+
 
 # -------------------------
 # Local config
