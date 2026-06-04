@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fusional"
+version = "0.1.0"
+description = "FusionAL: Combined ALSU + PretrainedAL-VS active learning framework"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+    "scipy",
+    "scikit-learn",
+    "pandas",
+    "tqdm",
+    "rdkit",
+    "p_tqdm",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["molpal*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
