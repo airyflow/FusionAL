@@ -4,49 +4,39 @@ preprocess_unimol.py — Generate and save UniMol 3D conformers for a dataset.
 
 This is a one-time step required before running UniMol fine-tuning (--surrogate
 ft_unimol).  It generates RDKit 3D conformers for every molecule in the library
-and caches them to:
+and caches them directly to:
 
     muben/data/files/<dataset>/processed/unimol-unimol/train.pt
 
-Once this file exists, BackboneFinetuner(backbone='unimol') loads it instantly
-instead of regenerating conformers each time.
+The file is saved in the exact dict format that muben's Dataset.load() expects,
+bypassing muben's fragile prepare()/create_features() pipeline entirely.
 
 Usage
 -----
     python preprocess_unimol.py --dataset Enamine50k
 
-This takes ~10-40 minutes on CPU (parallelised over --workers cores) or a few
-minutes on GPU.  Run once; subsequent AL experiments reuse the cache.
+This takes ~10-40 minutes on CPU (parallelised over --workers cores).
+Run once; subsequent AL experiments reuse the cache.
 """
 
 import argparse
 import sys
 import time
+from functools import partial
+from multiprocessing import get_context
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT))                      # FusionAL root on path
-sys.path.insert(0, str(ROOT / "muben"))            # muben package on path
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "muben"))
 
 MOLPAL_LIB = ROOT / "molpal" / "libraries"
 DATA_DIR   = ROOT / "muben" / "data" / "files"
-MODEL_ZOO  = ROOT / "models"
-
-
-# ── helpers ────────────────────────────────────────────────────────────────────
-
-def _make_molpal_reader(smiles_list: list):
-    """Return a monkey-patch for Dataset.read_csv that injects our SMILES."""
-    def _read_csv(self, data_dir, partition):
-        self._smiles  = list(smiles_list)
-        self._lbs     = np.zeros(len(smiles_list), dtype=np.float32)
-        self._masks   = np.ones(len(smiles_list),  dtype=np.float32)
-        self._ori_ids = None
-        return self
-    return _read_csv
 
 
 def load_library_smiles(dataset: str) -> list:
@@ -62,87 +52,89 @@ def load_library_smiles(dataset: str) -> list:
     raise FileNotFoundError(f"Library not found for '{dataset}' in {MOLPAL_LIB}")
 
 
-# ── main ───────────────────────────────────────────────────────────────────────
+def _generate_one(smiles: str):
+    """Worker: generate conformers for a single SMILES. Returns (atoms, coordinates)."""
+    from muben.utils.chem import smiles_to_coords
+    try:
+        return smiles_to_coords(smiles, n_conformer=10)
+    except Exception as e:
+        # Return 2D fallback on failure so the pool never stalls
+        from muben.utils.chem import smiles_to_2d_coords
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return [], []
+        mol = AllChem.AddHs(mol)
+        atoms = [atom.GetSymbol() for atom in mol.GetAtoms()]
+        coords_2d = smiles_to_2d_coords(smiles).astype(np.float32)
+        return atoms, [coords_2d] * 11
+
 
 def preprocess(dataset: str, workers: int):
-    from muben.dataset import DatasetUniMol
-    import muben.dataset.dataset as _ds_module
-
     smiles = load_library_smiles(dataset)
+    N = len(smiles)
 
-    # Monkey-patch so muben reads our SMILES instead of a CSV file
-    _ds_module.Dataset.read_csv = _make_molpal_reader(smiles)
-
-    unimol_ckpt = str(MODEL_ZOO / "unimol" / "mol_pre_all_h_220816.pt")
-    results_dir = ROOT / "results" / "embed" / dataset
-
-    class _Cfg:
-        model_name                  = "unimol"
-        feature_type                = "unimol"
-        data_dir                    = str(DATA_DIR / dataset)
-        checkpoint_path             = unimol_ckpt
-        unimol_feature_dir          = str(results_dir)
-        num_preprocess_workers      = workers
-        ignore_preprocessed_dataset = False   # use cache if it exists
-        disable_dataset_saving      = False   # save after generation
-        disable_checkpoint_loading  = False
-        # UniMol architecture
-        max_atoms               = 64
-        max_seq_len             = 80
-        only_polar_hydrogens    = False
-        remove_hydrogen         = True
-        remove_polar_hydrogen   = False
-        encoder_embed_dim       = 512
-        encoder_layers          = 15
-        encoder_attention_heads = 64
-        encoder_ffn_embed_dim   = 2048
-        activation_fn           = "gelu"
-        pooler_stride           = 1
-        pooler_dropout          = 0.0
-        emb_dropout             = 0.1
-        attention_dropout       = 0.1
-        activation_dropout      = 0.0
-        delta_pair_repr_norm_loss = -1
-        masked_coord_loss       = 0.0
-        masked_dist_loss        = 0.0
-        masked_type_loss        = 0.0
-        pooler_activation_fn    = "Tanh"
-        uncertainty_method      = "none"
-        task_type               = "regression"
-        n_lbs = 1
-        n_tasks = 1
-        bbp_prior_sigma = 0.5
-
-    cfg = _Cfg()
-
-    # Make sure the output directory exists
-    out_dir = Path(cfg.data_dir) / "processed" / "unimol-unimol"
+    out_dir = DATA_DIR / dataset / "processed" / "unimol-unimol"
     out_dir.mkdir(parents=True, exist_ok=True)
-
     cached = out_dir / "train.pt"
-    if cached.exists():
-        import torch
-        existing = torch.load(cached, weights_only=False)
-        n_cached = len(existing.get("_smiles", []))
-        if n_cached == len(smiles):
-            print(f"[cache] {cached} already has {n_cached:,} molecules — nothing to do.")
-            return
-        else:
-            print(f"[cache] {cached} has {n_cached:,} molecules but pool has {len(smiles):,}. Regenerating.")
-            cached.unlink()
 
-    print(f"\nGenerating UniMol 3D conformers for {len(smiles):,} molecules...")
+    # Validate existing cache
+    if cached.exists():
+        try:
+            existing = torch.load(cached, weights_only=False)
+            n_cached = len(existing.get("_smiles", []))
+            n_atoms  = len(existing.get("_atoms",  []))
+            if n_cached == N and n_atoms == N:
+                print(f"[cache] {cached} already has {n_cached:,} molecules with conformers — nothing to do.")
+                return
+            else:
+                print(f"[cache] {cached}: {n_cached:,} SMILES, {n_atoms:,} atom lists (expected {N:,}). Regenerating.")
+        except Exception as e:
+            print(f"[cache] {cached} is corrupt ({e}). Regenerating.")
+        cached.unlink()
+
+    print(f"\nGenerating UniMol 3D conformers for {N:,} molecules …")
     print(f"Workers: {workers}  |  Output: {cached}")
     print("This may take 10-40 minutes depending on hardware.\n")
 
     t0 = time.perf_counter()
-    dataset_obj = DatasetUniMol()
-    dataset_obj.prepare(config=cfg, partition="train")
+    all_atoms       = []
+    all_coordinates = []
+
+    with get_context("fork").Pool(workers) as pool:
+        for atoms, coordinates in tqdm(
+            pool.imap(_generate_one, smiles),
+            total=N,
+            desc="conformers",
+        ):
+            all_atoms.append(atoms)
+            all_coordinates.append(coordinates)
+
     elapsed = time.perf_counter() - t0
 
-    n = len(dataset_obj)
-    print(f"\n[done] {n:,} molecules preprocessed in {elapsed:.1f}s  ({elapsed/60:.1f} min)")
-    print(f"       Saved to: {cached}")
+    # Verify before saving
+    assert len(all_atoms) == N, f"Expected {N} atom lists, got {len(all_atoms)}"
+    empty = sum(1 for a in all_atoms if len(a) == 0)
+    if empty > 0:
+        print(f"[warn] {empty} molecules produced empty atom lists (will still save)")
+
+    # Save in the exact format muben Dataset.load() expects
+    attr_dict = {
+        "_smiles":      smiles,
+        "_lbs":         np.zeros((N, 1), dtype=np.float32),
+        "_masks":       np.ones((N, 1),  dtype=np.float32),
+        "_ori_ids":     None,
+        "_partition":   "train",
+        "_atoms":       all_atoms,
+        "_coordinates": all_coordinates,
+    }
+    torch.save(attr_dict, cached)
+
+    saved_size_mb = cached.stat().st_size / 1e6
+    print(f"\n[done] {N:,} molecules in {elapsed:.1f}s ({elapsed/60:.1f} min)")
+    print(f"       {empty} empty conformers  |  file size: {saved_size_mb:.1f} MB")
+    print(f"       Saved → {cached}")
     print(f"\nYou can now run ft_unimol experiments:")
     print(f"  python run_al.py --mode mve --dataset {dataset} --surrogate ft_unimol \\")
     print(f"    --backbones unimol --acq ucb --n-rounds 5")
