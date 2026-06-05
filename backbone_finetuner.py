@@ -192,15 +192,16 @@ class BackboneFinetuner:
             self._emb_dim = int(self._emb_grover(_probe).shape[-1])
 
     def _setup_unimol(self, dataset_name, pool_smiles, model_zoo):
-        from muben.dataset import DatasetUniMol
+        # Loads only the model weights + collator — no 50k conformer dataset.
+        # Conformers for fine-tuning are generated on-the-fly per labeled batch.
+        # The full pool conformer cache is lazy-loaded on the first
+        # extract_pool_embeddings() call and kept in memory for subsequent rounds.
         from muben.dataset.dataset_unimol import CollatorUniMol
         from muben.dataset.dataset_unimol.dictionary import DictionaryUniMol
+        from muben.dataset.dataset_unimol.process import ProcessingPipeline
         from muben.model.unimol.unimol import UniMol
 
-        _inject_smiles(pool_smiles)
         cfg = _MubenConfig("unimol", model_zoo, dataset_name)
-
-        self._pool_dataset = DatasetUniMol().prepare(config=cfg, partition="train")
 
         d = DictionaryUniMol.load()
         d.add_symbol("[MASK]", is_special=True)
@@ -210,6 +211,22 @@ class BackboneFinetuner:
         collator.pad_idx       = pad_idx
         collator.atom_pad_idx  = pad_idx
         self._collator = collator
+
+        # Processing pipeline — used to convert raw atoms/coords → model input dicts.
+        # process_training picks ONE random conformer → shape (1, seq_len) per item.
+        # process_inference stacks ALL conformers → shape (n_conf, seq_len) per item.
+        # _emb_unimol expects (B, seq_len) so we always use process_training here.
+        pipeline = ProcessingPipeline(
+            dictionary=d,
+            max_atoms=cfg.max_atoms,
+            max_seq_len=cfg.max_seq_len,
+            remove_hydrogen_flag=cfg.remove_hydrogen,
+            remove_polar_hydrogen_flag=cfg.remove_polar_hydrogen,
+        )
+        self._unimol_process = pipeline.process_training
+
+        self._unimol_cfg  = cfg
+        self._pool_dataset = None   # lazy-loaded on first extract_pool_embeddings()
 
         self._model   = UniMol(config=cfg, dictionary=d).to(DEVICE)
         self._emb_dim = cfg.encoder_embed_dim   # 512
@@ -304,11 +321,13 @@ class BackboneFinetuner:
 
         if self.backbone == "molformer":
             self._ft_molformer(labeled_smiles, y_norm, n_epochs, batch_size, opt)
+        elif self.backbone == "unimol":
+            self._ft_unimol(labeled_smiles, y_norm, n_epochs, batch_size, opt)
         else:
             self._ft_muben(labeled_smiles, y_norm, n_epochs, batch_size, opt)
 
     def _ft_muben(self, labeled_smiles, y_norm, n_epochs, batch_size, opt):
-        """Finetune loop for graph/3D backbones (GROVER, UniMol)."""
+        """Finetune loop for graph/3D backbones (GROVER). Uses cached pool dataset."""
         labeled_idx = np.array([self._smi2idx[s] for s in labeled_smiles])
         y_t = torch.tensor(y_norm, dtype=torch.float32)
 
@@ -327,6 +346,70 @@ class BackboneFinetuner:
 
                 # Collate a batch directly from the cached pool dataset
                 items = [self._pool_dataset[int(i)] for i in pool_idx]
+                batch = self._collator(items)
+                batch.to(DEVICE)
+
+                opt.zero_grad()
+                pred = self._head(self._get_emb(batch)).squeeze(-1)
+                loss = F.mse_loss(pred, targets)
+                loss.backward()
+                opt.step()
+
+                total_loss += loss.item()
+                n_steps    += 1
+
+            if (epoch + 1) % max(1, n_epochs // 3) == 0:
+                logger.info(
+                    f"  [finetune] epoch {epoch+1}/{n_epochs}  "
+                    f"loss={total_loss / n_steps:.4f}"
+                )
+
+    def _ft_unimol(self, labeled_smiles, y_norm, n_epochs, batch_size, opt):
+        """Finetune loop for UniMol — generates conformers on-the-fly.
+
+        Pre-generates raw (atoms, coordinates) tuples once per round (fast, ~1-3k
+        SMILES via RDKit), then re-samples one conformer per molecule per batch
+        step via process_training so each epoch sees different 3D views.
+        """
+        from muben.utils.chem import smiles_to_coords
+
+        # Generate raw conformers once per round — only 1-3k molecules, fast.
+        raw_conformers = []
+        for smi in labeled_smiles:
+            atoms, coords = smiles_to_coords(smi, n_conformer=10)
+            raw_conformers.append((atoms, coords))
+
+        y_t = torch.tensor(y_norm, dtype=torch.float32)
+        idx = np.arange(len(labeled_smiles))
+
+        self._model.train()
+        self._head.train()
+
+        for epoch in range(n_epochs):
+            perm       = np.random.permutation(idx)
+            total_loss = 0.0
+            n_steps    = 0
+
+            for start in range(0, len(labeled_smiles), batch_size):
+                chunk   = perm[start : start + batch_size]
+                targets = y_t[chunk].to(DEVICE)
+
+                # Re-sample a conformer per molecule each batch (augmentation).
+                # _unimol_process = process_training → conformer_sampling picks
+                # a new random conformer each call → shape (1, seq_len) per item.
+                items = []
+                for i in chunk:
+                    atoms, coordinates = raw_conformers[int(i)]
+                    a_t, c_t, d_t, e_t = self._unimol_process(
+                        atoms=atoms, coordinates=coordinates
+                    )
+                    items.append({
+                        "atoms": a_t, "coordinates": c_t,
+                        "distances": d_t, "edge_types": e_t,
+                        "lbs":   np.zeros((1,), dtype=np.float32),
+                        "masks": np.ones((1,),  dtype=np.float32),
+                    })
+
                 batch = self._collator(items)
                 batch.to(DEVICE)
 
@@ -400,6 +483,29 @@ class BackboneFinetuner:
                         self.pool_smiles[i : i + batch_size]
                     ).float()
                     parts.append(emb.cpu().numpy())
+        elif self.backbone == "unimol":
+            # Lazy-load the full pool conformer cache on the first extraction.
+            # Kept in self._pool_dataset for subsequent rounds (no reload needed).
+            if self._pool_dataset is None:
+                self._pool_dataset = self._load_unimol_pool_dataset()
+            loader = DataLoader(
+                self._pool_dataset,
+                batch_size  = batch_size,
+                shuffle     = False,
+                collate_fn  = self._collator,
+                num_workers = 0,
+            )
+            amp_dtype = (torch.bfloat16
+                         if (DEVICE.type == "cuda" and torch.cuda.is_bf16_supported())
+                         else torch.float16)
+            with torch.no_grad():
+                for batch in loader:
+                    batch.to(DEVICE)
+                    with torch.autocast(device_type=DEVICE.type,
+                                        dtype=amp_dtype,
+                                        enabled=(DEVICE.type == "cuda")):
+                        emb = self._get_emb(batch).float()
+                    parts.append(emb.cpu().numpy())
         else:
             loader = DataLoader(
                 self._pool_dataset,
@@ -421,3 +527,42 @@ class BackboneFinetuner:
                     parts.append(emb.cpu().numpy())
 
         return np.vstack(parts)
+
+    def _load_unimol_pool_dataset(self):
+        """Lazy-load the full pool conformer cache from train.pt for UniMol."""
+        import os.path as osp
+        from muben.dataset import DatasetUniMol
+
+        cfg = self._unimol_cfg
+        preprocessed_path = osp.normpath(osp.join(
+            cfg.data_dir, "processed", "unimol-unimol", "train.pt"
+        ))
+
+        if not osp.exists(preprocessed_path):
+            raise FileNotFoundError(
+                f"UniMol conformer cache not found: {preprocessed_path}\n"
+                f"Run: python preprocess_unimol.py --dataset {self._dataset_name}"
+            )
+
+        print(f"[BackboneFinetuner] Loading UniMol conformer cache ({preprocessed_path})…")
+        _inject_smiles(self.pool_smiles)
+        dataset = DatasetUniMol()
+        # Set up the processing pipeline before loading (it's not serialized in train.pt)
+        from muben.dataset.dataset_unimol.process import ProcessingPipeline
+        from muben.dataset.dataset_unimol.dictionary import DictionaryUniMol
+        d = DictionaryUniMol.load()
+        d.add_symbol("[MASK]", is_special=True)
+        dataset.processing_pipeline = ProcessingPipeline(
+            dictionary=d,
+            max_atoms=cfg.max_atoms,
+            max_seq_len=cfg.max_seq_len,
+            remove_hydrogen_flag=cfg.remove_hydrogen,
+            remove_polar_hydrogen_flag=cfg.remove_polar_hydrogen,
+        )
+        # Must use "training" variant: process_inference stacks ALL n_conf conformers
+        # per item → batch shape (B*n_conf, seq_len), but _emb_unimol expects (B, seq_len).
+        dataset.set_processor_variant("training")
+        dataset._partition = "train"
+        dataset.load(preprocessed_path)
+        print(f"[BackboneFinetuner] Loaded {len(dataset.atoms):,} conformers.")
+        return dataset
