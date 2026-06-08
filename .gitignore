@@ -63,7 +63,7 @@ pip-wheel-metadata/
 # -------------------------
 # Model Zoo (large)
 # -------------------------
-/models/
+/models
 model_zoo/
 checkpoints/
 pretrained/
@@ -79,7 +79,7 @@ runs/
 wandb/
 tensorboard/
 logs/
-data/
+/data
 
 
 # -------------------------
