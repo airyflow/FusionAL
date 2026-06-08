@@ -8,6 +8,8 @@ and caches them directly to:
 
     muben/data/files/<dataset>/processed/unimol-unimol/train.pt
 
+The preprocessing step converts molecules → 3D features → PyTorch tensors → saved as a .pt dataset.
+
 The file is saved in the exact dict format that muben's Dataset.load() expects,
 bypassing muben's fragile prepare()/create_features() pipeline entirely.
 
