@@ -365,68 +365,16 @@ class BackboneFinetuner:
                 )
 
     def _ft_unimol(self, labeled_smiles, y_norm, n_epochs, batch_size, opt):
-        """Finetune loop for UniMol — generates conformers on-the-fly.
+        """UniMol fine-tuning: lazy-loads the pool conformer cache, then
+        delegates to _ft_muben for cached index-based lookup.
 
-        Pre-generates raw (atoms, coordinates) tuples once per round (fast, ~1-3k
-        SMILES via RDKit), then re-samples one conformer per molecule per batch
-        step via process_training so each epoch sees different 3D views.
+        Generating conformers from SMILES serially (~2.5 it/s) for 1-3k molecules
+        would take 10+ min. The cached train.pt already has all 50k conformers —
+        looking up by pool index via pool_dataset[i] is effectively instant.
         """
-        from muben.utils.chem import smiles_to_coords
-
-        # Generate raw conformers once per round — only 1-3k molecules, fast.
-        raw_conformers = []
-        for smi in labeled_smiles:
-            atoms, coords = smiles_to_coords(smi, n_conformer=10)
-            raw_conformers.append((atoms, coords))
-
-        y_t = torch.tensor(y_norm, dtype=torch.float32)
-        idx = np.arange(len(labeled_smiles))
-
-        self._model.train()
-        self._head.train()
-
-        for epoch in range(n_epochs):
-            perm       = np.random.permutation(idx)
-            total_loss = 0.0
-            n_steps    = 0
-
-            for start in range(0, len(labeled_smiles), batch_size):
-                chunk   = perm[start : start + batch_size]
-                targets = y_t[chunk].to(DEVICE)
-
-                # Re-sample a conformer per molecule each batch (augmentation).
-                # _unimol_process = process_training → conformer_sampling picks
-                # a new random conformer each call → shape (1, seq_len) per item.
-                items = []
-                for i in chunk:
-                    atoms, coordinates = raw_conformers[int(i)]
-                    a_t, c_t, d_t, e_t = self._unimol_process(
-                        atoms=atoms, coordinates=coordinates
-                    )
-                    items.append({
-                        "atoms": a_t, "coordinates": c_t,
-                        "distances": d_t, "edge_types": e_t,
-                        "lbs":   np.zeros((1,), dtype=np.float32),
-                        "masks": np.ones((1,),  dtype=np.float32),
-                    })
-
-                batch = self._collator(items)
-                batch.to(DEVICE)
-
-                opt.zero_grad()
-                pred = self._head(self._get_emb(batch)).squeeze(-1)
-                loss = F.mse_loss(pred, targets)
-                loss.backward()
-                opt.step()
-
-                total_loss += loss.item()
-                n_steps    += 1
-
-            if (epoch + 1) % max(1, n_epochs // 3) == 0:
-                logger.info(
-                    f"  [finetune] epoch {epoch+1}/{n_epochs}  "
-                    f"loss={total_loss / n_steps:.4f}"
-                )
+        if self._pool_dataset is None:
+            self._pool_dataset = self._load_unimol_pool_dataset()
+        self._ft_muben(labeled_smiles, y_norm, n_epochs, batch_size, opt)
 
     def _ft_molformer(self, labeled_smiles, y_norm, n_epochs, batch_size, opt):
         """Finetune loop for MoLFormer (tokenizer-based)."""
