@@ -69,7 +69,7 @@ FusionAL/
 
 | `--surrogate`       | Description                                                                 |
 |---------------------|-----------------------------------------------------------------------------|
-| `single`            | One backbone, dual MVE head (μ + σ²), Gaussian NLL + Spearman loss        |
+| `single`            | One backbone, dual MVE head (μ + σ²), Gaussian NLL + Spearman loss          |
 | `lightweight`       | Concatenated embeddings → lightweight MVE head                              |
 | `bigfusion`         | Three independent single-backbone surrogates → Borda count fusion          |
 | `ensemble`          | Ensemble of MVE heads, one per backbone                                     |
@@ -92,21 +92,66 @@ All 9 PretrainedAL-VS metrics plus Borda count:
 
 ---
 
-## Setup
+## Installation (GPU)
 
-### Conda environment
+FusionAL requires Python 3.10, PyTorch (GPU), RDKit, and the PyTorch Geometric stack. Install in three steps.
+
+### 1. Create the conda environment
 
 ```bash
-conda activate muben   # /media/4T-Samsung2/jmeng/miniconda3/envs/muben
+conda env create -f environment.yml -n py310
+conda activate py310
+```
+
+This installs Python 3.10, RDKit, PyTorch + CUDA 12.1, and all pip-based dependencies.
+
+### 2. Install PyTorch Geometric (CUDA 12.1 wheels)
+
+PyTorch Geometric must be installed manually because it requires CUDA-specific wheels.
+
+```bash
+pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv \
+    -f https://data.pyg.org/whl/torch-2.1.0+cu121.html
+
+pip install torch_geometric
+```
+
+### 3. Verify installation
+
+```bash
+python - << 'EOF'
+import torch, rdkit, torch_geometric
+print("CUDA available:", torch.cuda.is_available())
+print("RDKit OK")
+print("PyG OK")
+EOF
+```
+
+Expected output:
+
+```
+CUDA available: True
+RDKit OK
+PyG OK
+```
+
+---
+
+## Setup
+
+### Activate the environment
+
+```bash
+conda activate py310
 ```
 
 ### Symlinks (already configured)
 
 ```bash
 # These symlinks should already exist:
-ls -la /home/jmeng/repos/FusionAL/data          # → ALSU/data
-ls -la /home/jmeng/repos/FusionAL/models        # → ALSU/models
-ls -la /home/jmeng/repos/FusionAL/muben         # → ALSU/muben
+ls -la /home/jmeng/repos/FusionAL/data              # → ALSU/data
+ls -la /home/jmeng/repos/FusionAL/models            # → ALSU/models
+ls -la /home/jmeng/repos/FusionAL/muben             # → ALSU/muben
 ls -la /home/jmeng/repos/FusionAL/molpal/libraries  # → PretrainedAL-VS/libraries
 ```
 

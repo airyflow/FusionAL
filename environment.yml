@@ -1,0 +1,37 @@
+name: py310
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+
+  # Core scientific stack
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - matplotlib
+
+  # RDKit (CPU-only but works fine in GPU env)
+  - rdkit
+
+  # PyTorch GPU stack (CUDA 12.1)
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+
+  - pip:
+      - descriptastorus
+      - dgllife
+      - lmdb
+      - regex
+      - torchmetrics
+      - tqdm
+      - transformers
+      - typing_extensions
+      - wandb
