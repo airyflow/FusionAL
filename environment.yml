@@ -1,7 +1,5 @@
 name: py310
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
   - defaults
 
@@ -19,13 +17,17 @@ dependencies:
   # RDKit (CPU-only but works fine in GPU env)
   - rdkit
 
-  # PyTorch GPU stack (CUDA 12.1)
-  - pytorch
-  - torchvision
-  - torchaudio
-  - pytorch-cuda=12.1
+  # DO NOT install PyTorch from conda (CPU-only)
+  # We will install GPU PyTorch via pip below
 
   - pip:
+      # GPU-enabled PyTorch (CUDA 12.1)
+      - torch==2.3.1
+      - torchvision==0.18.1
+      - torchaudio==2.3.1
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+
+      # Other Python packages
       - descriptastorus
       - dgllife
       - lmdb
